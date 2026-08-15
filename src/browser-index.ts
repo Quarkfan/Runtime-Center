@@ -2,12 +2,14 @@ import { buildBrowserApp } from "./browser-app.js";
 import { createHash } from "node:crypto";
 import { HttpBrowserDependencies } from "./browser-clients.js";
 import { BrowserWorkerService, PlaywrightEngine } from "./browser.js";
-const token = process.env.INTERNAL_SERVICE_TOKEN ?? "development-only";
-const stateSecret = process.env.BROWSER_STATE_KEY_BASE64;
-if (process.env.NODE_ENV === "production" && !stateSecret)
-  throw new Error("BROWSER_STATE_KEY_BASE64 is required in production");
+import {
+  requireBrowserStateKey,
+  requireInternalServiceToken,
+} from "./config.js";
+const token = requireInternalServiceToken();
+const stateSecret = requireBrowserStateKey();
 const stateKey = createHash("sha256")
-  .update(Buffer.from(stateSecret ?? "development-browser-state"))
+  .update(stateSecret)
   .update("quarkfantools/browser-storage-state/v1")
   .digest();
 const root = process.env.BROWSER_SESSION_ROOT ?? "./browser-sessions";

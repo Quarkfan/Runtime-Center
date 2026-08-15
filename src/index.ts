@@ -10,12 +10,13 @@ import { PgRuntimeRepository } from "./pg-repository.js";
 import { MemoryRuntimeRepository } from "./repository.js";
 import { RuntimeService } from "./service.js";
 import type { RuntimeKind } from "./types.js";
+import { requireInternalServiceToken } from "./config.js";
 const url = process.env.DATABASE_URL;
 const repository = url
   ? new PgRuntimeRepository(url)
   : new MemoryRuntimeRepository();
 await repository.migrate();
-const token = process.env.INTERNAL_SERVICE_TOKEN ?? "development-only";
+const token = requireInternalServiceToken();
 const clients = new HttpPlatformClients(
   {
     model: process.env.MODEL_HUB_URL ?? "http://127.0.0.1:4103",

@@ -1,0 +1,27 @@
+FROM node:22-bookworm-slim AS build
+WORKDIR /app
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+COPY package*.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+FROM node:22-bookworm-slim
+RUN sed -i 's|deb.debian.org/debian|mirrors.cloud.tencent.com/debian|g; s|security.debian.org/debian-security|mirrors.cloud.tencent.com/debian-security|g' /etc/apt/sources.list.d/debian.sources \
+  && apt-get update \
+  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends chromium ca-certificates ffmpeg fonts-noto-cjk \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+ENV NODE_ENV=production \
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+  BROWSER_EXECUTABLE_PATH=/usr/bin/chromium \
+  BROWSER_SESSION_ROOT=/var/lib/quarkfan/browser-sessions
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY --from=build /app/dist ./dist
+RUN mkdir -p /var/lib/quarkfan/browser-sessions /home/node/.cache/ms-playwright/ffmpeg-1011 \
+  && ln -sf /usr/bin/ffmpeg /home/node/.cache/ms-playwright/ffmpeg-1011/ffmpeg-linux \
+  && chown -R node:node /var/lib/quarkfan/browser-sessions /home/node/.cache/ms-playwright
+USER node
+CMD ["node","dist/src/browser-index.js"]

@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, writeFile } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import type {
   BrowserDependencies,
@@ -113,6 +113,7 @@ describe("Browser Worker", () => {
     };
     return {
       service: new BrowserWorkerService(engine, deps, root),
+      root,
       handle,
       getOpens: () => opens,
       artifacts,
@@ -255,5 +256,16 @@ describe("Browser Worker", () => {
       artifacts.some((artifact) => artifact.mediaType === "image/png"),
     ).toBe(true);
     expect(service.listSessions({ tenantId: "t1" })).toHaveLength(1);
+  });
+  it("removes persisted state when a session is explicitly deleted", async () => {
+    const { service, root } = await setup(false, false);
+    const request = { ...base, actions: [] };
+    await service.run(request);
+    const directory = `${root}/${service.key(request)}`;
+    await writeFile(`${directory}/storage-state.enc`, "encrypted-state");
+
+    await service.closeSession(base.tenantId, base.botId, base.sessionKey);
+
+    await expect(access(directory)).rejects.toThrow();
   });
 });

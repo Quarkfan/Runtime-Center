@@ -830,6 +830,7 @@ export class BrowserWorkerService {
       },
       key = this.key(request),
       artifactIds = await this.close(key, request, true);
+    await rm(join(this.root, key), { recursive: true, force: true });
     return {
       closed: artifactIds.length > 0 || !this.sessions.has(key),
       artifactIds,

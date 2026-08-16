@@ -36,6 +36,21 @@ export class RuntimeService {
       updatedAt: timestamp,
     });
   }
+  async bot(id: string) {
+    const bot = await this.repo.bot(id);
+    if (!bot)
+      throw Object.assign(new Error("Bot not found"), { statusCode: 404 });
+    return bot;
+  }
+  async removeBot(id: string) {
+    const bot = await this.bot(id);
+    if (bot.purpose === "system-assistant")
+      throw Object.assign(new Error("System assistant cannot be deleted"), {
+        statusCode: 409,
+      });
+    await this.repo.removeBot(id);
+    return { removed: true };
+  }
   async create(i: RuntimeInput) {
     const bot = await this.repo.bot(i.botId);
     if (!bot)

@@ -114,6 +114,28 @@ describe("Runtime Center", () => {
       response: "done",
     });
   });
+  it("updates ordinary bots and protects the system assistant from deletion", async () => {
+    const { repo, service } = await setup();
+    const current = await service.bot("b1");
+    const { createdAt: _createdAt, updatedAt: _updatedAt, ...input } = current;
+    await service.saveBot({ ...input, name: "Updated bot", enabled: false });
+    expect(await service.bot("b1")).toMatchObject({
+      name: "Updated bot",
+      enabled: false,
+    });
+    await expect(service.removeBot("b1")).resolves.toEqual({ removed: true });
+    expect(await repo.bot("b1")).toBeUndefined();
+    const system = await service.bot("b2");
+    const {
+      createdAt: _systemCreatedAt,
+      updatedAt: _systemUpdatedAt,
+      ...systemInput
+    } = system;
+    await service.saveBot({ ...systemInput, purpose: "system-assistant" });
+    await expect(service.removeBot("b2")).rejects.toThrow(
+      "System assistant cannot be deleted",
+    );
+  });
   it("enforces read-only executions with no resolved capabilities or outbound effects", async () => {
     const { repo, service, clients, calls, observed } = await setup();
     const current = (await repo.bot("b1"))!;

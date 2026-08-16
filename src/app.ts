@@ -67,13 +67,27 @@ export function buildApp(o: {
       .code(201)
       .send(ok(await o.service.saveBot(botBody.parse(req.body)), req.id)),
   );
+  app.get("/v1/bots/:id", async (req) =>
+    ok(
+      await o.service.bot(
+        z.object({ id: z.string() }).parse(req.params).id,
+      ),
+      req.id,
+    ),
+  );
+  app.put("/v1/bots/:id", async (req) => {
+    const { id } = z.object({ id: z.string() }).parse(req.params);
+    await o.service.bot(id);
+    return ok(
+      await o.service.saveBot(botBody.parse({ ...(req.body as object), id })),
+      req.id,
+    );
+  });
   app.delete("/v1/bots/:id", async (req) =>
     ok(
-      {
-        removed: await o.repository.removeBot(
-          z.object({ id: z.string() }).parse(req.params).id,
-        ),
-      },
+      await o.service.removeBot(
+        z.object({ id: z.string() }).parse(req.params).id,
+      ),
       req.id,
     ),
   );

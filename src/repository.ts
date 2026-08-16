@@ -2,7 +2,10 @@ import type {
   BotDefinition,
   Execution,
   RuntimeEvent,
+  RuntimeProfile,
+  RuntimeProviderRecord,
   RuntimeSession,
+  SessionLedgerEvent,
 } from "./types.js";
 export interface RuntimeRepository {
   migrate(): Promise<void>;
@@ -29,12 +32,30 @@ export interface RuntimeRepository {
     botId?: string;
   }): Promise<RuntimeSession[]>;
   removeSession(id: string): Promise<boolean>;
+  saveRuntimeProvider(v: RuntimeProviderRecord): Promise<RuntimeProviderRecord>;
+  runtimeProvider(id: string): Promise<RuntimeProviderRecord | undefined>;
+  runtimeProviders(): Promise<RuntimeProviderRecord[]>;
+  saveRuntimeProfile(v: RuntimeProfile): Promise<RuntimeProfile>;
+  runtimeProfile(id: string): Promise<RuntimeProfile | undefined>;
+  runtimeProfiles(tenantId?: string): Promise<RuntimeProfile[]>;
+  removeRuntimeProfile(id: string): Promise<boolean>;
+  appendSessionEvent(
+    v: Omit<SessionLedgerEvent, "sequence">,
+  ): Promise<SessionLedgerEvent>;
+  sessionEvents(
+    sessionId: string,
+    after?: number,
+    limit?: number,
+  ): Promise<SessionLedgerEvent[]>;
 }
 export class MemoryRuntimeRepository implements RuntimeRepository {
   b = new Map<string, BotDefinition>();
   e = new Map<string, Execution>();
   v: RuntimeEvent[] = [];
   s = new Map<string, RuntimeSession>();
+  rp = new Map<string, RuntimeProviderRecord>();
+  profiles = new Map<string, RuntimeProfile>();
+  ledger: SessionLedgerEvent[] = [];
   async migrate() {}
   async ping() {
     return true;
@@ -104,5 +125,52 @@ export class MemoryRuntimeRepository implements RuntimeRepository {
   }
   async removeSession(id: string) {
     return this.s.delete(id);
+  }
+  async saveRuntimeProvider(v: RuntimeProviderRecord) {
+    this.rp.set(v.descriptor.providerId, structuredClone(v));
+    return v;
+  }
+  async runtimeProvider(id: string) {
+    const value = this.rp.get(id);
+    return value ? structuredClone(value) : undefined;
+  }
+  async runtimeProviders() {
+    return [...this.rp.values()].map((value) => structuredClone(value));
+  }
+  async saveRuntimeProfile(v: RuntimeProfile) {
+    this.profiles.set(v.id, structuredClone(v));
+    return v;
+  }
+  async runtimeProfile(id: string) {
+    const value = this.profiles.get(id);
+    return value ? structuredClone(value) : undefined;
+  }
+  async runtimeProfiles(tenantId?: string) {
+    return [...this.profiles.values()]
+      .filter((value) => !tenantId || value.tenantId === tenantId)
+      .map((value) => structuredClone(value));
+  }
+  async removeRuntimeProfile(id: string) {
+    return this.profiles.delete(id);
+  }
+  async appendSessionEvent(v: Omit<SessionLedgerEvent, "sequence">) {
+    const existing = this.ledger.find(
+      (item) => item.idempotencyKey === v.idempotencyKey,
+    );
+    if (existing) return structuredClone(existing);
+    const event = {
+      ...v,
+      sequence:
+        this.ledger.filter((item) => item.sessionId === v.sessionId).length + 1,
+    };
+    this.ledger.push(structuredClone(event));
+    return event;
+  }
+  async sessionEvents(sessionId: string, after = 0, limit = 200) {
+    return this.ledger
+      .filter((item) => item.sessionId === sessionId && item.sequence > after)
+      .sort((a, b) => a.sequence - b.sequence)
+      .slice(0, limit)
+      .map((item) => structuredClone(item));
   }
 }

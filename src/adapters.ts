@@ -13,6 +13,7 @@ import {
 import { createHash } from "node:crypto";
 import type { PlatformClients } from "./clients.js";
 import type { Execution } from "./types.js";
+import { CapabilityFacade } from "./capability-facade.js";
 export interface RuntimeContext {
   execution: Execution;
   workspace: string;
@@ -20,6 +21,7 @@ export interface RuntimeContext {
   abortController: AbortController;
   contextItems: any[];
   capabilities: any[];
+  capabilityFacade?: CapabilityFacade;
   emit: (type: any, data: Record<string, unknown>) => Promise<void>;
 }
 export interface AgentRuntime {
@@ -35,6 +37,14 @@ const outputText = (v: unknown): string => {
   }
   return String(v ?? "");
 };
+const capabilityFacade = (context: RuntimeContext, clients: PlatformClients) =>
+  context.capabilityFacade ??
+  new CapabilityFacade(
+    clients,
+    context.execution,
+    context.capabilities,
+    context.emit,
+  );
 export class ModelToolLoopRuntime implements AgentRuntime {
   kind = "model-tool-loop" as const;
   constructor(
@@ -125,39 +135,19 @@ export class ModelToolLoopRuntime implements AgentRuntime {
         const capability = toolMap.get(call.name);
         if (!capability)
           throw new Error(`Model requested an unavailable tool: ${call.name}`);
-        await v.emit("tool_call", {
-          toolCallId: call.id,
-          capabilityId: capability.manifest.id,
-          input: call.input,
-        });
         try {
-          const invoked = await this.clients.invokeCapability(
-            {
-              tenantId: v.execution.tenantId,
-              botId: v.execution.botId,
-              capabilityId: capability.manifest.id,
-              input: call.input,
-              trigger:
-                v.execution.source.type === "scheduled" ||
-                v.execution.source.type === "continuation"
-                  ? "scheduled"
-                  : "agent",
-              correlationId: `${v.execution.id}:${call.id}`,
-              approvalId: v.execution.approvalId,
-            },
-            v.abortController.signal,
-          );
-          await v.emit("tool_result", {
-            toolCallId: call.id,
+          const output = await capabilityFacade(v, this.clients).invoke({
             capabilityId: capability.manifest.id,
-            status: "succeeded",
-            output: invoked.output,
+            value: call.input,
+            toolCallId: call.id,
+            runtime: this.kind,
+            signal: v.abortController.signal,
           });
           messages.push({
             role: "tool",
             toolCallId: call.id,
             name: call.name,
-            content: JSON.stringify(invoked.output ?? null),
+            content: JSON.stringify(output ?? null),
           });
         } catch (error) {
           if (
@@ -169,12 +159,6 @@ export class ModelToolLoopRuntime implements AgentRuntime {
             throw error;
           const message =
             error instanceof Error ? error.message : String(error);
-          await v.emit("tool_result", {
-            toolCallId: call.id,
-            capabilityId: capability.manifest.id,
-            status: "failed",
-            error: message,
-          });
           messages.push({
             role: "tool",
             toolCallId: call.id,
@@ -272,7 +256,7 @@ class ModelHubModel implements Model {
     const calls = normalizeToolCalls(result.output),
       text = outputText(
         result.output && typeof result.output === "object"
-          ? (result.output as Record<string, unknown>).text ?? ""
+          ? ((result.output as Record<string, unknown>).text ?? "")
           : result.output,
       ),
       output: ModelResponse["output"] = [];
@@ -350,45 +334,16 @@ export class OpenAIAgentsRuntime implements AgentRuntime {
             execute: async (input, _runContext, details) => {
               const toolCallId =
                 details?.toolCall?.callId ?? `${name}-${Date.now()}`;
-              await v.emit("tool_call", {
-                toolCallId,
-                capabilityId: capability.manifest.id,
-                input,
-                runtime: this.kind,
-              });
               try {
-                const invoked = await this.clients.invokeCapability(
-                  {
-                    tenantId: v.execution.tenantId,
-                    botId: v.execution.botId,
-                    capabilityId: capability.manifest.id,
-                    input,
-                    trigger:
-                      v.execution.source.type === "scheduled" ||
-                      v.execution.source.type === "continuation"
-                        ? "scheduled"
-                        : "agent",
-                    correlationId: `${v.execution.id}:${toolCallId}`,
-                    approvalId: v.execution.approvalId,
-                  },
-                  details?.signal ?? v.abortController.signal,
-                );
-                await v.emit("tool_result", {
-                  toolCallId,
+                const output = await capabilityFacade(v, this.clients).invoke({
                   capabilityId: capability.manifest.id,
-                  status: "succeeded",
-                  output: invoked.output,
+                  value: input,
+                  toolCallId,
                   runtime: this.kind,
+                  signal: details?.signal ?? v.abortController.signal,
                 });
-                return JSON.stringify(invoked.output ?? null);
+                return JSON.stringify(output ?? null);
               } catch (error) {
-                await v.emit("tool_result", {
-                  toolCallId,
-                  capabilityId: capability.manifest.id,
-                  status: "failed",
-                  error: error instanceof Error ? error.message : String(error),
-                  runtime: this.kind,
-                });
                 throw error;
               }
             },
@@ -560,6 +515,10 @@ export class ClaudeCodeRuntime implements AgentRuntime {
         ]),
     ) as Record<string, McpServerConfig>;
     const context = v.contextItems.map((x) => x.content).join("\n\n");
+    const workspaceTools =
+      v.execution.effectMode === "read-only"
+        ? ["Skill", "Read", "Glob", "Grep"]
+        : ["Skill", "Read", "Write", "Edit", "Glob", "Grep", "Bash"];
     let response = "",
       sessionId = v.execution.sessionId;
     for await (const item of query({
@@ -583,16 +542,8 @@ export class ClaudeCodeRuntime implements AgentRuntime {
         ...(sessionId ? { resume: sessionId } : {}),
         settingSources: [],
         skills: "all",
-        tools: ["Skill", "Read", "Write", "Edit", "Glob", "Grep", "Bash"],
-        allowedTools: [
-          "Skill",
-          "Read",
-          "Write",
-          "Edit",
-          "Glob",
-          "Grep",
-          "Bash",
-        ],
+        tools: workspaceTools,
+        allowedTools: workspaceTools,
         mcpServers: mcp,
         strictMcpConfig: true,
         permissionMode: "bypassPermissions",

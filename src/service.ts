@@ -2,6 +2,12 @@ import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import type { AgentRuntime } from "./adapters.js";
+import {
+  builtInRuntimeProvider,
+  legacyRuntimeName,
+  normalizeRuntimeProviderId,
+  RuntimeProviderRegistry,
+} from "./providers.js";
 import type { PlatformClients } from "./clients.js";
 import type { RuntimeRepository } from "./repository.js";
 import type {
@@ -9,23 +15,35 @@ import type {
   Execution,
   RuntimeEvent,
   RuntimeInput,
+  RuntimeProfile,
+  RuntimeProfileSnapshot,
   RuntimeSession,
 } from "./types.js";
 import { WorkflowRunner } from "./workflow.js";
+import { CapabilityFacade } from "./capability-facade.js";
 const now = () => new Date().toISOString();
 export class RuntimeService {
   private running = new Set<string>();
   private activeByBot = new Map<string, number>();
   private controllers = new Map<string, AbortController>();
   private readonly workflowRunner: WorkflowRunner;
+  readonly providers: RuntimeProviderRegistry;
   constructor(
     readonly repo: RuntimeRepository,
     readonly clients: PlatformClients,
-    readonly adapters: Map<Execution["runtime"], AgentRuntime>,
+    providers:
+      RuntimeProviderRegistry | Map<Execution["runtime"], AgentRuntime>,
     readonly root: string,
     readonly sessionTtlMs = 24 * 60 * 60 * 1000,
   ) {
     this.workflowRunner = new WorkflowRunner(clients);
+    if (providers instanceof RuntimeProviderRegistry)
+      this.providers = providers;
+    else {
+      this.providers = new RuntimeProviderRegistry(repo);
+      for (const adapter of providers.values())
+        this.providers.mount(builtInRuntimeProvider(adapter));
+    }
   }
   async saveBot(input: Omit<BotDefinition, "createdAt" | "updatedAt">) {
     const old = await this.repo.bot(input.id);
@@ -50,6 +68,60 @@ export class RuntimeService {
       });
     await this.repo.removeBot(id);
     return { removed: true };
+  }
+  async saveProfile(
+    input: Omit<RuntimeProfile, "revision" | "createdAt" | "updatedAt">,
+  ) {
+    const old = await this.repo.runtimeProfile(input.id);
+    const provider = this.providers.get(input.runtimeProviderId);
+    const fallbackProviderIds = [...new Set(input.fallbackProviderIds)].filter(
+      (id) => normalizeRuntimeProviderId(id) !== provider.descriptor.providerId,
+    );
+    for (const id of fallbackProviderIds) this.providers.get(id);
+    if (
+      !input.enabled &&
+      old?.enabled &&
+      (await this.repo.bots()).some(
+        (bot) => bot.runtimeProfileId === input.id && bot.enabled,
+      )
+    )
+      throw Object.assign(
+        new Error("Runtime profile is used by an enabled bot"),
+        { statusCode: 409 },
+      );
+    if (
+      ["disabled", "failed", "retired"].includes(provider.lifecycleState) &&
+      input.enabled
+    )
+      throw Object.assign(
+        new Error(`Runtime provider is ${provider.lifecycleState}`),
+        { statusCode: 409 },
+      );
+    const timestamp = now();
+    return this.repo.saveRuntimeProfile({
+      ...input,
+      runtimeProviderId: provider.descriptor.providerId,
+      fallbackProviderIds: fallbackProviderIds.map(normalizeRuntimeProviderId),
+      revision: (old?.revision ?? 0) + 1,
+      createdAt: old?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+    });
+  }
+  async profile(id: string) {
+    const value = await this.repo.runtimeProfile(id);
+    if (!value)
+      throw Object.assign(new Error("Runtime profile not found"), {
+        statusCode: 404,
+      });
+    return value;
+  }
+  async removeProfile(id: string) {
+    await this.profile(id);
+    if ((await this.repo.bots()).some((bot) => bot.runtimeProfileId === id))
+      throw Object.assign(new Error("Runtime profile is referenced by a bot"), {
+        statusCode: 409,
+      });
+    return { removed: await this.repo.removeRuntimeProfile(id) };
   }
   async create(i: RuntimeInput) {
     const bot = await this.repo.bot(i.botId);
@@ -89,18 +161,23 @@ export class RuntimeService {
       session.modelSessionId = i.sessionId;
       session = await this.repo.saveSession(session);
     }
+    const profileSnapshot = await this.resolveProfileSnapshot(i, bot);
     const v: Execution = {
       id: executionId,
       tenantId: i.tenantId,
       botId: i.botId,
-      runtime: i.runtime ?? bot?.runtime ?? "model-tool-loop",
+      runtime: legacyRuntimeName(profileSnapshot.provider.providerId),
+      runtimeProviderId: profileSnapshot.provider.providerId,
+      runtimeSessionId: session.id,
+      runtimeProfileSnapshot: profileSnapshot,
       prompt: i.prompt,
       systemPrompt: i.systemPrompt ?? bot?.systemPrompt,
       conversationId: i.conversationId,
       conversationKey,
       workspaceId: session.workspaceId,
       sessionId: session.modelSessionId,
-      modelPolicyId: i.modelPolicyId ?? bot?.modelPolicyId,
+      modelPolicyId:
+        i.modelPolicyId ?? profileSnapshot.modelPolicyId ?? bot?.modelPolicyId,
       effectMode: bot.effectMode ?? "standard",
       capabilityPolicy: bot.capabilityPolicy ?? "resolved",
       source: i.source ?? {},
@@ -108,6 +185,16 @@ export class RuntimeService {
       createdAt: n,
     };
     await this.repo.saveExecution(v);
+    await this.appendLedger(
+      v,
+      "input/accepted",
+      {
+        prompt: v.prompt,
+        source: v.source,
+        profileSnapshot,
+      },
+      "input",
+    );
     await this.emit(v, "progress", { message: "Execution queued" });
     return v;
   }
@@ -126,6 +213,12 @@ export class RuntimeService {
         createdAt: now(),
       };
     await this.repo.append(v);
+    await this.appendLedger(
+      e,
+      ledgerEventType(type),
+      data,
+      `execution-event:${v.sequence}`,
+    );
   }
   async run(id: string, contextQuery?: string) {
     if (this.running.has(id)) return;
@@ -295,27 +388,47 @@ export class RuntimeService {
       await this.emit(e, "context", {
         count: context.items?.length ?? 0,
         traceId: context.traceId,
+        materializedItems: (context.items ?? []).map((item: any) => ({
+          id: item.id,
+          content: item.content,
+          sourceId: item.sourceId,
+          citation: item.citation,
+        })),
       });
       await this.emit(e, "capabilities", {
         count: capabilities.items?.length ?? 0,
         ids: (capabilities.items ?? []).map((x: any) => x.manifest.id),
+        schemas: (capabilities.items ?? []).map((x: any) => ({
+          id: x.manifest.id,
+          version: x.manifest.version,
+          kind: x.manifest.kind,
+          inputSchema: x.manifest.inputSchema,
+        })),
         policy: e.capabilityPolicy,
       });
       const workspace = join(this.root, e.tenantId, e.botId, e.workspaceId);
       await mkdir(workspace, { recursive: true });
       await this.materializeSkills(workspace, capabilities.items ?? []);
-      const adapter = this.adapters.get(e.runtime);
-      if (!adapter)
-        throw new Error(`Runtime adapter unavailable: ${e.runtime}`);
-      const result = await adapter.run({
-        execution: e,
-        workspace,
-        history: (await this.sessionForExecution(e))?.messages ?? [],
-        abortController: controller,
-        contextItems: context.items ?? [],
-        capabilities: capabilities.items ?? [],
-        emit: (t, d) => this.emit(e, t, d),
-      });
+      const emit = (t: RuntimeEvent["type"], d: Record<string, unknown>) =>
+        this.emit(e, t, d);
+      const result = await this.providers.run(
+        e.runtimeProviderId ?? normalizeRuntimeProviderId(e.runtime),
+        {
+          execution: e,
+          workspace,
+          history: (await this.sessionForExecution(e))?.messages ?? [],
+          abortController: controller,
+          contextItems: context.items ?? [],
+          capabilities: capabilities.items ?? [],
+          capabilityFacade: new CapabilityFacade(
+            this.clients,
+            e,
+            capabilities.items ?? [],
+            emit,
+          ),
+          emit,
+        },
+      );
       controller.signal.throwIfAborted();
       e.response = result.response;
       e.sessionId = result.sessionId ?? e.sessionId;
@@ -704,6 +817,7 @@ export class RuntimeService {
     const deadline = Date.now() + 30_000;
     while (this.controllers.size && Date.now() < deadline)
       await new Promise((resolve) => setTimeout(resolve, 10));
+    await this.providers.dispose();
   }
   async sessions(filter: { tenantId?: string; botId?: string }) {
     return this.repo.sessions(filter);
@@ -717,6 +831,105 @@ export class RuntimeService {
   async removeSession(id: string, tenantId?: string) {
     await this.getSession(id, tenantId);
     return this.repo.removeSession(id);
+  }
+  async sessionEvents(id: string, tenantId?: string, after = 0, limit = 200) {
+    await this.getSession(id, tenantId);
+    return this.repo.sessionEvents(
+      id,
+      after,
+      Math.min(500, Math.max(1, limit)),
+    );
+  }
+  private async resolveProfileSnapshot(
+    input: RuntimeInput,
+    bot: BotDefinition,
+  ): Promise<RuntimeProfileSnapshot> {
+    const profileId = input.runtimeProfileId ?? bot.runtimeProfileId;
+    if (profileId) {
+      const profile = await this.profile(profileId);
+      if (profile.tenantId !== input.tenantId)
+        throw Object.assign(
+          new Error("Runtime profile does not belong to tenant"),
+          { statusCode: 403 },
+        );
+      if (!profile.enabled)
+        throw Object.assign(new Error("Runtime profile is disabled"), {
+          statusCode: 409,
+        });
+      const primary = this.providers.get(profile.runtimeProviderId);
+      const candidates = [
+        primary,
+        ...profile.fallbackProviderIds.map((id) => this.providers.get(id)),
+      ];
+      const record = candidates.find(
+        (candidate) =>
+          ["active", "canary"].includes(candidate.lifecycleState) &&
+          candidate.lastProbe?.status !== "unavailable" &&
+          candidate.lastProbe?.status !== "incompatible",
+      );
+      if (!record)
+        throw Object.assign(
+          new Error("Runtime profile has no available provider"),
+          { statusCode: 503 },
+        );
+      return {
+        snapshotId: randomUUID(),
+        profileId: profile.id,
+        profileRevision: profile.revision,
+        resolvedAt: now(),
+        provider: structuredClone(record.descriptor),
+        modelPolicyId: profile.modelPolicyId,
+        contextPolicyId: profile.contextPolicyId,
+        capabilityBindingSetId: profile.capabilityBindingSetId,
+        governancePolicyId: profile.governancePolicyId,
+        workspacePolicyId: profile.workspacePolicyId,
+        promptSectionRefs: [...profile.promptSectionRefs],
+        limits: structuredClone(profile.limits),
+        fallbackProviderIds: [...profile.fallbackProviderIds],
+        compatibility: false,
+      };
+    }
+    const providerId = normalizeRuntimeProviderId(
+      input.runtimeProviderId ??
+        input.runtime ??
+        bot.runtime ??
+        "model-tool-loop",
+    );
+    const record = this.providers.get(providerId);
+    return {
+      snapshotId: randomUUID(),
+      profileId: `compat:${bot.id}`,
+      profileRevision: 1,
+      resolvedAt: now(),
+      provider: structuredClone(record.descriptor),
+      modelPolicyId: input.modelPolicyId ?? bot.modelPolicyId,
+      promptSectionRefs: [],
+      limits: { maxConcurrentExecutions: bot.maxConcurrentExecutions },
+      fallbackProviderIds: [],
+      compatibility: true,
+    };
+  }
+  private async appendLedger(
+    execution: Execution,
+    eventType: string,
+    payload: Record<string, unknown>,
+    suffix: string,
+  ) {
+    if (!execution.runtimeSessionId) return;
+    await this.repo.appendSessionEvent({
+      id: randomUUID(),
+      sessionId: execution.runtimeSessionId,
+      eventType,
+      schemaVersion: "1.0",
+      executionId: execution.id,
+      tenantId: execution.tenantId,
+      botId: execution.botId,
+      correlationId: String(execution.source.correlationId ?? execution.id),
+      idempotencyKey: `${execution.id}:${suffix}`,
+      producer: { center: "runtime-center", version: "0.2.0" },
+      payload,
+      createdAt: now(),
+    });
   }
   private conversationKey(input: RuntimeInput, executionId: string) {
     if (!input.conversationId) return `execution:${executionId}`;
@@ -823,6 +1036,23 @@ export class RuntimeService {
 
 function isResetPrompt(prompt: string) {
   return ["/new", "新对话", "重置会话"].includes(prompt.trim().toLowerCase());
+}
+
+function ledgerEventType(type: RuntimeEvent["type"]) {
+  const mapping: Record<RuntimeEvent["type"], string> = {
+    started: "turn/started",
+    context: "context/materialized",
+    capabilities: "capability/snapshot-resolved",
+    progress: "execution/progress",
+    tool_call: "capability/requested",
+    tool_result: "capability/completed",
+    session: "session/provider-state",
+    result: "turn/ended",
+    delivery: "output/delivered",
+    error: "execution/failed",
+    cancelled: "execution/cancelled",
+  };
+  return mapping[type];
 }
 
 function parseContinuation(prompt: string) {

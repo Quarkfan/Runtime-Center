@@ -3,13 +3,15 @@ import {
   ClaudeCodeRuntime,
   ModelToolLoopRuntime,
   OpenAIAgentsRuntime,
-  type AgentRuntime,
 } from "./adapters.js";
+import {
+  builtInRuntimeProvider,
+  RuntimeProviderRegistry,
+} from "./providers.js";
 import { HttpPlatformClients } from "./clients.js";
 import { PgRuntimeRepository } from "./pg-repository.js";
 import { MemoryRuntimeRepository } from "./repository.js";
 import { RuntimeService } from "./service.js";
-import type { RuntimeKind } from "./types.js";
 import { requireInternalServiceToken } from "./config.js";
 const url = process.env.DATABASE_URL;
 const repository = url
@@ -29,11 +31,22 @@ const clients = new HttpPlatformClients(
   },
   token,
 );
-const adapters = new Map<RuntimeKind, AgentRuntime>([
-  ["model-tool-loop", new ModelToolLoopRuntime(clients)],
-  ["openai-agents", new OpenAIAgentsRuntime(clients)],
-  [
-    "claude-code",
+const claudeEnabled = process.env.CLAUDE_RUNTIME_ENABLED === "true";
+const providers = new RuntimeProviderRegistry(repository);
+providers.mount(
+  builtInRuntimeProvider(new ModelToolLoopRuntime(clients), {
+    displayName: "Model Tool Loop",
+    description: "QuarkfanTools native model and governed capability loop",
+  }),
+);
+providers.mount(
+  builtInRuntimeProvider(new OpenAIAgentsRuntime(clients), {
+    displayName: "OpenAI Agents SDK",
+    description: "OpenAI Agents SDK bridged through Model Hub",
+  }),
+);
+providers.mount(
+  builtInRuntimeProvider(
     new ClaudeCodeRuntime({
       enabled: process.env.CLAUDE_RUNTIME_ENABLED === "true",
       baseUrl: process.env.CLAUDE_RUNTIME_BASE_URL,
@@ -41,12 +54,19 @@ const adapters = new Map<RuntimeKind, AgentRuntime>([
       model: process.env.CLAUDE_RUNTIME_MODEL,
       maxTurns: Number(process.env.CLAUDE_RUNTIME_MAX_TURNS ?? 60),
     }),
-  ],
-]);
+    {
+      displayName: "Claude Code SDK",
+      description: "Claude Code runtime with workspace and MCP support",
+      enabled: () => claudeEnabled,
+      capabilities: { externalSessionImport: true, mcp: true },
+    },
+  ),
+);
+await providers.initialize();
 const service = new RuntimeService(
   repository,
   clients,
-  adapters,
+  providers,
   process.env.RUNTIME_WORKSPACE_ROOT ?? "./workspaces",
 );
 await service.recover();

@@ -43,9 +43,8 @@ export function buildApp(o: {
     name: z.string().min(1).max(100),
     description: z.string().max(500).optional(),
     enabled: z.boolean().default(true),
-    runtime: z
-      .enum(["model-tool-loop", "openai-agents", "claude-code"])
-      .default("model-tool-loop"),
+    runtime: z.string().min(1).max(200).default("model-tool-loop"),
+    runtimeProfileId: z.string().uuid().optional(),
     modelPolicyId: z.string().uuid().optional(),
     systemPrompt: z.string().max(30000).optional(),
     purpose: z.enum(["general", "system-assistant"]).default("general"),
@@ -69,9 +68,7 @@ export function buildApp(o: {
   );
   app.get("/v1/bots/:id", async (req) =>
     ok(
-      await o.service.bot(
-        z.object({ id: z.string() }).parse(req.params).id,
-      ),
+      await o.service.bot(z.object({ id: z.string() }).parse(req.params).id),
       req.id,
     ),
   );
@@ -91,14 +88,116 @@ export function buildApp(o: {
       req.id,
     ),
   );
+  const profileBody = z.object({
+    id: z.string().uuid(),
+    tenantId: z.string().min(1),
+    name: z.string().min(1).max(120),
+    description: z.string().max(1000).optional(),
+    enabled: z.boolean().default(true),
+    runtimeProviderId: z.string().min(1).max(200),
+    modelPolicyId: z.string().uuid().optional(),
+    contextPolicyId: z.string().optional(),
+    capabilityBindingSetId: z.string().optional(),
+    governancePolicyId: z.string().optional(),
+    workspacePolicyId: z.string().optional(),
+    promptSectionRefs: z.array(z.string()).default([]),
+    limits: z
+      .record(z.string(), z.union([z.boolean(), z.string(), z.number()]))
+      .default({}),
+    fallbackProviderIds: z.array(z.string()).default([]),
+  });
+  app.get("/v1/runtime-providers", async (req) =>
+    ok(o.service.providers.list(), req.id),
+  );
+  app.get("/v1/runtime-providers/:id", async (req) =>
+    ok(
+      o.service.providers.get(
+        z.object({ id: z.string() }).parse(req.params).id,
+      ),
+      req.id,
+    ),
+  );
+  app.post("/v1/runtime-providers/:id/probe", async (req) =>
+    ok(
+      await o.service.providers.probe(
+        z.object({ id: z.string() }).parse(req.params).id,
+      ),
+      req.id,
+    ),
+  );
+  app.post("/v1/runtime-providers/:id/lifecycle/:state", async (req) => {
+    const { id, state } = z
+      .object({
+        id: z.string(),
+        state: z.enum([
+          "installed",
+          "verified",
+          "canary",
+          "active",
+          "draining",
+          "disabled",
+          "failed",
+          "retired",
+        ]),
+      })
+      .parse(req.params);
+    return ok(await o.service.providers.transition(id, state), req.id);
+  });
+  app.get("/v1/runtime-providers/:id/logs", async (req) =>
+    ok(
+      o.service.providers.logsFor(
+        z.object({ id: z.string() }).parse(req.params).id,
+      ),
+      req.id,
+    ),
+  );
+  app.get("/v1/runtime-profiles", async (req) => {
+    const { tenantId } = z
+      .object({ tenantId: z.string().optional() })
+      .parse(req.query);
+    return ok(await o.repository.runtimeProfiles(tenantId), req.id);
+  });
+  app.post("/v1/runtime-profiles", async (req, reply) =>
+    reply
+      .code(201)
+      .send(
+        ok(await o.service.saveProfile(profileBody.parse(req.body)), req.id),
+      ),
+  );
+  app.get("/v1/runtime-profiles/:id", async (req) =>
+    ok(
+      await o.service.profile(
+        z.object({ id: z.string().uuid() }).parse(req.params).id,
+      ),
+      req.id,
+    ),
+  );
+  app.put("/v1/runtime-profiles/:id", async (req) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
+    await o.service.profile(id);
+    return ok(
+      await o.service.saveProfile(
+        profileBody.parse({ ...(req.body as object), id }),
+      ),
+      req.id,
+    );
+  });
+  app.delete("/v1/runtime-profiles/:id", async (req) =>
+    ok(
+      await o.service.removeProfile(
+        z.object({ id: z.string().uuid() }).parse(req.params).id,
+      ),
+      req.id,
+    ),
+  );
   app.post("/v1/executions", async (req, reply) => {
     const input = z
       .object({
         tenantId: z.string(),
         botId: z.string(),
-        runtime: z
-          .enum(["model-tool-loop", "openai-agents", "claude-code"])
-          .optional(),
+        runtime: z.string().min(1).max(200).optional(),
+        runtimeProviderId: z.string().min(1).max(200).optional(),
+        runtimeProfileId: z.string().uuid().optional(),
         prompt: z.string().min(1),
         systemPrompt: z.string().optional(),
         conversationId: z.string().optional(),
@@ -155,6 +254,25 @@ export function buildApp(o: {
       .object({ tenantId: z.string().optional() })
       .parse(req.query);
     return ok(await o.service.getSession(id, tenantId), req.id);
+  });
+  app.get("/v1/sessions/:id/events", async (req) => {
+    const { id } = z.object({ id: z.string().uuid() }).parse(req.params);
+    const query = z
+      .object({
+        tenantId: z.string().optional(),
+        after: z.coerce.number().int().nonnegative().default(0),
+        limit: z.coerce.number().int().min(1).max(500).default(200),
+      })
+      .parse(req.query);
+    return ok(
+      await o.service.sessionEvents(
+        id,
+        query.tenantId,
+        query.after,
+        query.limit,
+      ),
+      req.id,
+    );
   });
   app.delete("/v1/sessions/:id", async (req) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(req.params);

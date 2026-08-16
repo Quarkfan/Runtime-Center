@@ -1,8 +1,8 @@
 # Runtime Center
 
-Execution plane for QuarkfanTools 3.0. Initial adapters are direct Model Hub tool-loop and externally configured Claude/OpenAI agent runtimes. Every execution resolves context and capabilities, obtains a governance decision, allocates a workspace and emits durable events.
+Execution plane for QuarkfanTools 3.0. Runtime engines are mounted as versioned Provider plugins through the exact-pinned Cordis-backed PluginKernel. Every execution resolves an immutable Runtime Profile snapshot, context and capability visibility, obtains a governance decision, allocates a workspace and appends operational plus session-ledger events.
 
-The next architecture replaces hard-coded runtime kinds with versioned Runtime Providers, declarative Runtime Profiles, a Session Event Ledger and one governed capability pipeline. DeepSeek's Cordis Core is being adopted behind a QuarkfanTools Plugin SDK as the internal composition kernel; it is not a security sandbox and does not cross center boundaries.
+The current production architecture replaces the startup adapter map with versioned Runtime Providers, declarative Runtime Profiles, a Session Event Ledger and a shared Capability Facade. Existing Bot runtime strings remain a compatibility input. Cordis is an internal composition kernel, not a security sandbox, and never crosses center boundaries.
 
 Design entry points:
 

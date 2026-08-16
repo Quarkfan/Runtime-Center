@@ -162,11 +162,11 @@ Ledger verification adds property tests for sequence/order, crash/failure inject
 
 ## 12. Migration increments
 
-1. Introduce contracts, provider registry and wrappers for all current adapters.
-2. Add profiles and migrate Bot references while retaining compatibility reads.
-3. Add ledger dual-write and shadow projections.
-4. Route all tool schema/execution through the common facade.
-5. Switch reads to projections, import legacy sessions and remove truncation.
-6. Add canary/drain/rollback APIs and Dashboard views.
+1. **Implemented:** contracts, Provider Registry and wrappers for all current adapters.
+2. **Implemented:** revisioned Profiles and optional Bot references with compatibility admission for legacy runtime strings.
+3. **Implemented:** Session Ledger dual-write for new executions and cursor reads; mutable history remains the compatibility projection.
+4. **Implemented for platform-owned loops:** Model Tool Loop and OpenAI Agents route capability execution through one facade. Claude Code declares its SDK-owned inner-loop boundary and applies read-only workspace-tool restrictions.
+5. **Next evolution:** switch history reads to ledger projections, import legacy sessions and remove mutable-history truncation after replay equivalence is proven in production.
+6. **Implemented:** Provider probe/lifecycle/log APIs, Profile CRUD and Dashboard list/detail views. Runtime lifecycle/Profile state is durable; image rollout/rollback remains Deployment-owned.
 
 No big-bang data migration is required, but each increment must be reversible and independently deployable.
